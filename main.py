@@ -63,8 +63,12 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     if chunk_size is None:
         chunk_size = max_prompt_len
 
+    """
+    cache를 통해 출력 전달
+    """
     # Encode prompt by chunks
     for s in range(0, max_prompt_len, chunk_size):
+        #입력 프롬프트를 정크 단위로 나눔
         prompt_chunks = [p[s:s+chunk_size] for p in encoded_prompts]
         assert all(len(p) > 0 for p in prompt_chunks)
         prelogits = model.forward(

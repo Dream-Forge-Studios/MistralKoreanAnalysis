@@ -65,7 +65,7 @@ class Attention(nn.Module):
         self.n_heads: int = args.n_heads
         self.head_dim: int = args.head_dim
         self.n_kv_heads: int = args.n_kv_heads
-
+        # Grouped-Query Attention(GQA)
         self.repeats = self.n_heads // self.n_kv_heads
 
         self.scale = self.args.head_dim**-0.5
@@ -83,10 +83,12 @@ class Attention(nn.Module):
     ) -> torch.Tensor:
         seqlen_sum, _ = x.shape
 
+        #입력 값 query, value, key으로 변환
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(seqlen_sum, self.n_heads, self.head_dim)
         xk = xk.view(seqlen_sum, self.n_kv_heads, self.head_dim)
         xv = xv.view(seqlen_sum, self.n_kv_heads, self.head_dim)
+        # 위치 정보 추가
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         if cache is None:
@@ -108,6 +110,7 @@ class Attention(nn.Module):
         key, val = repeat_kv(key, val, self.repeats, dim=1)
 
         # xformers requires (B=1, S, H, D)
+        #b: 배치크기, S: 시퀀스 길이, H: 헤드수, D: 헤드당 차원
         xq, key, val = xq[None, ...], key[None, ...], val[None, ...]
         output = memory_efficient_attention(
             xq, key, val, None if cache is None else cache.mask
@@ -252,8 +255,17 @@ class Transformer(nn.Module):
         if cache is not None:
             input_metadata = cache.get_input_metadata(seqlens)
         else:
+            """
+            시퀀스의 위치 정보 저장
+            두 개의 시퀀스 [5, 7]이 있다면,
+            [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 5, 6]
+            """
             input_metadata = SimpleInputMetadata.from_seqlens(seqlens, self.device)
 
+        """
+        pipeline_rank 병렬 처리를 위해 존재
+        모델이 전체 파이프라인(num_pipeline_ranks)에서 어느 위치에 있는지를 나타냄
+        """
         if self.pipeline_rank == 0:
             assert self.tok_embeddings is not None
             h = self.tok_embeddings(input_ids)
@@ -261,8 +273,10 @@ class Transformer(nn.Module):
             h = torch.empty(
                 num_toks, self.args.dim, device=self.device, dtype=self.dtype
             )
+            #병렬 처리하는 여러개의 노드 중 이전 단계 출력을 가져옴
             torch.distributed.recv(h, src=self.pipeline_rank - 1)
 
+        #위치 정보를 가져옴
         freqs_cis = self.freqs_cis[input_metadata.positions]
 
         for local_layer_id, layer in enumerate(self.layers.values()):
@@ -271,6 +285,7 @@ class Transformer(nn.Module):
                 cache_view = cache.get_view(local_layer_id, input_metadata)
             else:
                 cache_view = None
+            #TransformerBlock
             h = layer(h, freqs_cis, cache_view)
 
         if cache is not None:
