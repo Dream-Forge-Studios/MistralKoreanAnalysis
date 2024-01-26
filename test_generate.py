@@ -49,7 +49,7 @@ def test_generation():
     tokenizer = DebugTokenizer()
 
     # for attempt in range(10):
-    toks, all_logprobs_old = generate(sequences, model, tokenizer, max_tokens=7)
+    toks, all_logprobs_old = generate(sequences, model, tokenizer, max_tokens=7, temperature=0.7)
     toks = [" ".join(r.split(" ")[1:]) for r in toks] # Remove BOS
     generated, all_logprobs_new = generate(toks, model, tokenizer, max_tokens=0)
     assert generated == []

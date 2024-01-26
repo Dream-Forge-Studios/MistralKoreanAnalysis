@@ -94,7 +94,12 @@ class Attention(nn.Module):
         if cache is None:
             key, val = xk, xv
         elif cache.prefill:
+            """
+            현재 토큰에서 어텐션을 할 때 필요한 이전 시퀀스의 토큰들을 넣어줌
+            이전 시퀀스의 추가적인 계산이 없도록 함 (pre-fill)
+            """
             key, val = cache.interleave_kv(xk, xv)
+            #캐시 업데이트
             cache.update(xk, xv)
         else:
             cache.update(xk, xv)
@@ -263,11 +268,11 @@ class Transformer(nn.Module):
             input_metadata = SimpleInputMetadata.from_seqlens(seqlens, self.device)
 
         """
-        pipeline_rank 병렬 처리를 위해 존재
         모델이 전체 파이프라인(num_pipeline_ranks)에서 어느 위치에 있는지를 나타냄
         """
         if self.pipeline_rank == 0:
             assert self.tok_embeddings is not None
+            #숫자로 된 토큰 식별자를 실수 벡터로 변환하여 신경망이 이해할 수 있는 형태로 만드는 첫 단계
             h = self.tok_embeddings(input_ids)
         else:
             h = torch.empty(
@@ -282,6 +287,10 @@ class Transformer(nn.Module):
         for local_layer_id, layer in enumerate(self.layers.values()):
             if cache is not None:
                 assert input_metadata is not None
+                """
+                텐서 데이터를 다룰 때, 실제 데이터를 복사하지 않고 특정 차원이나 구간을 선택적으로 접근하거나 해석하기 위한 방법으로 "view"를 사용
+                캐시 데이터에 접근하고 필요한 연산을 수행
+                """
                 cache_view = cache.get_view(local_layer_id, input_metadata)
             else:
                 cache_view = None

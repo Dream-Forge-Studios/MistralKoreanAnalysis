@@ -32,15 +32,19 @@ def interleave_list(l1: List[torch.Tensor], l2: List[torch.Tensor]):
     assert len(l1) == len(l2)
     return [v for pair in zip(l1, l2) for v in pair]
 
-
 def unrotate(cache: torch.Tensor, seqlen: int) -> torch.Tensor:
     assert cache.ndim == 3  # (W, H, D)
+    """
+    cache.shape[0] sliding_window 크기
+    seqlen 이전 시퀀스의 크기
+    """
     position = seqlen % cache.shape[0]
     if seqlen < cache.shape[0]:
         return cache[:seqlen]
     elif position == 0:
         return cache
     else:
+        #캐시에 저장된 이전 시퀀스의 원래 순서로 맞춰줌
         return torch.cat([cache[position:], cache[:position]], dim=0)
 
 
@@ -58,7 +62,12 @@ class CacheView:
         n_kv_heads, head_dim = self.cache_k.shape[-2:]
         flat_cache_k = self.cache_k.view(-1, n_kv_heads, head_dim)
         flat_cache_v = self.cache_v.view(-1, n_kv_heads, head_dim)
-        
+
+        """
+        다음 시퀀스를 처리할 때 필요한 정보를 캐시에 넣어줌
+        index_copy_할 떄,
+        view 메소드는 기본 데이터를 공유하는 새로운 텐서 뷰를 생성하므로, flat_cache_k에서의 변경사항은 원본 텐서인 self.cache_k에도 영향
+        """
         flat_cache_k.index_copy_(0, self.metadata.cache_positions, xk[self.metadata.to_cache_mask])
         flat_cache_v.index_copy_(0, self.metadata.cache_positions, xv[self.metadata.to_cache_mask])
 
@@ -74,17 +83,34 @@ class CacheView:
             return xk, xv
 
         # Make it a list of [(T, H, D)]
+        """
+        seqlens [5,7,2]
+        (tensor([0, 1, 2, 3, 4]),
+        tensor([ 5,  6,  7,  8,  9, 10, 11]),
+        tensor([12, 13]))
+        숫자 표현은 실제 벡터들의 임의 표현
+        """
         xk = torch.split(xk, self.metadata.seqlens)
         xv = torch.split(xv, self.metadata.seqlens)
         assert len(xk) == len(self.kv_seqlens), f"Batch size is {len(self.kv_seqlens)}, got {len(xk)}"
 
         # Order elements in cache by position by unrotating
+        """
+        self.cache_k, self.cache_v = [max_batch_size,sliding_window,n_kv_heads,head_dim] #이전 정보
+        sliding_window에 따라 사용할 값만 정리한 리스트
+        [sliding_window, n_kv_heads, head_dim]
+        캐시에 저장된 값을 원래 토큰의 순서로 정렬
+        """
         cache_k = [unrotate(t, s) for t, s in zip(self.cache_k, self.kv_seqlens)]
         cache_v = [unrotate(t, s) for t, s in zip(self.cache_v, self.kv_seqlens)]
 
+        """
+        이전 시퀀스(캐시)의 정보와 현재 시퀀스 정보 결합
+        """
         interleaved_k = interleave_list(cache_k, xk)
         interleaved_v = interleave_list(cache_v, xv)
 
+        #torch.cat dim에 차원에 따라 텐서를 합침
         return torch.cat(interleaved_k, dim=0), torch.cat(interleaved_v, dim=0)
 
     @property
@@ -134,6 +160,7 @@ class RotatingBufferCache:
             head_dim
         ))
         # holds the valid length for each batch element in the cache
+        # 이전 시퀀스에서 현재 토큰을 처리할 때 필요한 kv의 seqlens
         self.kv_seqlens = None
 
     def get_view(self, layer_id: int, metadata: RotatingCacheInputMetadata) -> CacheView:
@@ -181,38 +208,41 @@ class RotatingBufferCache:
 
         assert len(seqlens) > 0, seqlens
         """
-        mask를 적용할 곳 표시
-        mask = [[False, True, True], [True, False, True]]
+        슬라이딩 윈도우 어텐션에서 마지막 몇 개의 토큰만 캐시할지를 결정하기 위한 마스크 배열을 생성
+        seqlens = [8, 4, 4, 4] 
+        sliding_window = 3
+        일 떄,
+        masks = [[False, False, False, False, False, True, True, True], [False, True, True, True], [False, True, True, True], [False, True, True, True]]
         """
         masks = [
             [x >= seqlen - self.sliding_window for x in range(seqlen)]
             for seqlen in seqlens
         ]
-        #to_cache_mask = torch.tensor([False, True, True, True, False, True])
+        #to_cache_mask = tensor([False, False, False, False, False,  True,  True,  True, False,  True, True,  True, False,  True,  True,  True, False,  True,  True,  True],device='cuda:0')
         to_cache_mask = torch.tensor(sum(masks, []), device=self.device, dtype=torch.bool)
-        #[2, 2], True의 개수
+        #tensor([3, 3, 3, 3], device='cuda:0'), True의 개수
         cached_elements = torch.tensor([sum(mask) for mask in masks], device=self.device, dtype=torch.long)
         """
-        seqpos = [0, 5, 12, 15], seqlens = [5, 7, 3, 6]
-        첫 번째 시퀀스: torch.arange(0, 0 + 5) → [0, 1, 2, 3, 4]
-        두 번째 시퀀스: torch.arange(5, 5 + 7) → [5, 6, 7, 8, 9, 10, 11]
-        세 번째 시퀀스: torch.arange(12, 12 + 3) → [12, 13, 14]
-        네 번째 시퀀스: torch.arange(15, 15 + 6) → [15, 16, 17, 18, 19, 20]
-        positions = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+        seqpos = [5, 7, 3, 6], seqlens = [5, 7, 3, 6]
+        첫 번째 시퀀스: [5, 6, 7, 8, 9]
+        두 번째 시퀀스: [7, 8, 9, 10, 11, 12, 13]
+        세 번째 시퀀스: [3, 4, 5]
+        네 번째 시퀀스: [6, 7, 8, 9, 10, 11]
+        positions = torch.tensor([5, 6, 7, 8, 9, 7, 8, 9, 10, 11, 12, 13, 3, 4, 5, 6, 7, 8, 9, 10, 11])
         """
         positions = torch.cat([torch.arange(pos, pos + seqlen) for pos, seqlen in zip(seqpos, seqlens)]).to(device=self.device, dtype=torch.long)
         """
-        seqlens = [5, 7, 3, 6]
-        첫 번째 시퀀스: [0, 0, 0, 0, 0]
-        두 번째 시퀀스: [1, 1, 1, 1, 1, 1, 1]
-        세 번째 시퀀스: [2, 2, 2]
-        네 번째 시퀀스: [3, 3, 3, 3, 3, 3]
-        batch_idx = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3])
+        tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3], device='cuda:0')
         """
         batch_idx = torch.tensor(sum([[i]*seqlen for i, seqlen in enumerate(seqlens)], []), device=self.device, dtype=torch.long)
         """
         각 토큰이 슬라이딩 윈도우 기반의 캐시 시스템 내에서 어떤 위치에 저장되어야 하는지
         각 배치가 서로 겹치지 않도록 조정
+        positions = torch.tensor([5, 6, 7, 8, 9, 7, 8, 9, 10, 11, 12, 13, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        sliding_window = 3
+        batch_idx = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 3, 3])일 떄,
+        
+        tensor([2, 0, 1, 2, 0, 4, 5, 3, 4, 5, 3, 4, 6, 7, 8, 9, 10, 11, 9, 10, 11], device='cuda:0')
         """
         cache_positions = positions % self.sliding_window + batch_idx * self.sliding_window
 
@@ -222,17 +252,30 @@ class RotatingBufferCache:
         if first_prefill:
             assert all([pos == 0 for pos in seqpos]), (seqpos)
             """
-            BlockDiagonal: 마스크가 대각선을 중심으로 여러 개의 블록으로 구성
-            Causal: 토큰이 자신보다 이전에 나타난 토큰들과만 상호작용할 수 있도록 제한
+            BlockDiagonal: 시퀀스 내의 토큰들만 서로 어텐션을 수행할 수 있도록 제한
+            Causal: 시퀀스 블록 내에서 쿼리가 해당 위치 이전의 키들과만 상호작용하도록 제한
             """
             mask = BlockDiagonalCausalMask.from_seqlens(seqlens).make_local_attention(self.sliding_window)
         elif subsequent_prefill:
+            """
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            A = [0, 1, 2, 3, 4]
+            B = [5, 6, 7, 8, 9]
+            window_size = 3
+            B의 첫 번째 토큰(인덱스 5)의 어텐션
+            make_local_attention
+            3, 4, 5, 6, 7
+            make_local_attention_from_bottomright
+            2, 3, 4, 5, 6, 7
+            """
             mask = BlockDiagonalMask.from_seqlens(
                 q_seqlen=seqlens,
+                # 현재 처리 중인 시퀀스의 길이(s)에 이전에 캐시된 키와 값들(cached_s)의 수를 더해 새로운 시퀀스에 대한 총 어텐션 범위를 결정
                 kv_seqlen=[s + cached_s.clamp(max=self.sliding_window).item() for (s, cached_s) in zip(seqlens, self.kv_seqlens)]
             ).make_local_attention_from_bottomright(self.sliding_window)
         #모든 시퀀스가 하나의 토큰만 포함하는 경우
         else:
+            #BlockDiagonalCausalMask에서 모든 블록이 동일한 길이를 가지도록 패딩하는 기능 추가
             mask = BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
                 q_seqlen=seqlens,
                 kv_padding=self.sliding_window,

@@ -22,8 +22,11 @@ class MoeLayer(nn.Module):
         self.args = moe_args
 
     def forward(self, inputs: torch.Tensor):
+        #입력에 어떤 전문가가 적당한지를 계산
         gate_logits = self.gate(inputs)
+        #가장 높은 점수를 받은 전문가 num_experts_per_tok만큼 선택
         weights, selected_experts = torch.topk(gate_logits, self.args.num_experts_per_tok)
+        #선택된 전문가에 대한 가중치를 softmax 함수를 통해 정규화
         weights = F.softmax(weights, dim=1, dtype=torch.float).to(inputs.dtype)
         results = torch.zeros_like(inputs)
         for i, expert in enumerate(self.experts):

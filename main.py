@@ -56,6 +56,7 @@ def generate(prompts: List[str], model: Transformer, tokenizer: Tokenizer, *, ma
     
     # Bookkeeping
     logprobs = [[] for _ in range(B)]
+    #바로 이전 단계에서 예측된 마지막 토큰에 대한 모델의 로짓 값을 저장
     last_token_prelogits = None
 
     # One chunk if size not specified
